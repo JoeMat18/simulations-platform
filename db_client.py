@@ -2,7 +2,9 @@ import os
 import streamlit as st
 from pymongo import MongoClient
 from pymongo.errors import ServerSelectionTimeoutError
+from dotenv import load_dotenv 
 
+load_dotenv()
 
 @st.cache_resource
 def get_db_client():
@@ -15,10 +17,8 @@ def get_db_client():
         return None
 
     try:
-        # Create client with increased timeout
         client = MongoClient(mongo_uri, serverSelectionTimeoutMS=5000)
-        # Verify connection
-        client.admin.command('ping')
+        client.admin.command('ping')  # Проверка соединения
         st.success("Successfully connected to MongoDB!")
         return client
     except ServerSelectionTimeoutError as e:
@@ -28,12 +28,9 @@ def get_db_client():
         st.error(f"Unexpected error while connecting to MongoDB: {e}")
         return None
 
-
-# Create the client
 db_client = get_db_client()
 
 if db_client:
-    # Create/get the database and collection
     db = db_client["experiment_db"]
     experiments_collection = db["experiments"]
 else:

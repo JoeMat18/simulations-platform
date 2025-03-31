@@ -1,9 +1,12 @@
+import threading
 import streamlit as st
 import pandas as pd
 from datetime import datetime
 from pymongo import MongoClient
 from bson import ObjectId
 import os
+import zipfile
+import io
 
 from floodns.external.simulation.main import local_run_single_job
 from floodns.external.schemas.routing import Routing
@@ -25,51 +28,66 @@ def fetch_experiment_details(simulation_id):
         return None
 
 
-# Function to handle re-running an experiment
 def re_run_experiment(simulation_id):
     print(">>> re_run_experiment CALLED!", simulation_id)
     st.write(">>> re_run_experiment CALLED!", simulation_id)
-    try:
-        # Ставим статус
-        experiments_collection.update_one(
-            {"_id": ObjectId(simulation_id)},
-            {"$set": {"state": "Re-Running"}}
-        )
 
-        experiment = experiments_collection.find_one({"_id": ObjectId(simulation_id)})
-        if not experiment:
-            st.error("Experiment not found for re-run.")
-            return
+    # Update status first
+    experiments_collection.update_one(
+        {"_id": ObjectId(simulation_id)},
+        {"$set": {"state": "Re-Running"}}
+    )
 
-        params = experiment["params"]
-        num_jobs, num_cores, ring_size, routing_str, seed = params.split(",")
-        model = "BLOOM"
-        routing_enum = Routing[routing_str]
+    # Create a background thread for the long-running operation
+    def run_in_background():
+        try:
+            experiment = experiments_collection.find_one({"_id": ObjectId(simulation_id)})
+            if not experiment:
+                print("Experiment not found for re-run.")
+                return
 
-        st.write("Let's launch local_run_single_job...")
-        proc = local_run_single_job(
-            seed=int(seed),
-            n_core_failures=int(num_cores),
-            ring_size=int(ring_size),
-            model=model,
-            alg=routing_enum
-        )
-        st.write("local_run_single_job зcompleted. See logs in console Docker.")
+            params = experiment["params"]
+            num_jobs, num_cores, ring_size, routing_str, seed = params.split(",")
+            model = "BLOOM"
+            routing_enum = Routing[routing_str]
 
-        # Change the status to Finished (demo)
-        experiments_collection.update_one(
-            {"_id": ObjectId(simulation_id)},
-            {
-                "$set": {
-                    "state": "Finished",
-                    "end_time": datetime.now().isoformat(),
+            print("Let's launch local_run_single_job...")
+
+            # Ensure all path-related operations use correct paths
+            proc = local_run_single_job(
+                seed=int(seed),
+                n_core_failures=int(num_cores),
+                ring_size=int(ring_size),
+                model=model,
+                alg=routing_enum
+            )
+            print("local_run_single_job completed.")
+
+            # Update the status when done
+            experiments_collection.update_one(
+                {"_id": ObjectId(simulation_id)},
+                {
+                    "$set": {
+                        "state": "Finished",
+                        "end_time": datetime.now().isoformat(),
+                    }
                 }
-            },
-        )
-        st.success("Experiment re-run successfully!")
-    except Exception as e:
-        st.error(f"Error re-running experiment: {e}")
-        print(f"Exception in re_run_experiment: {e}")
+            )
+            print("Experiment re-run successfully!")
+        except Exception as e:
+            print(f"Error in background thread: {e}")
+            experiments_collection.update_one(
+                {"_id": ObjectId(simulation_id)},
+                {"$set": {"state": "Error", "error": str(e)}}
+            )
+
+    # Start the background thread
+    thread = threading.Thread(target=run_in_background)
+    thread.daemon = True
+    thread.start()
+
+    # Immediately return to keep the UI responsive
+    st.success("Experiment re-run started in the background. Please check back later for results.")
 
 
 # Function to handle saving edited experiments
@@ -126,18 +144,28 @@ def display_page(simulation_id):
             st.write(f"State: {experiment['state']}")
 
             if experiment.get("state") == "Finished" and experiment.get("run_dir"):
-                output_path = os.path.join(experiment["run_dir"], "output.txt")
-                st.subheader("Simulation Output")
-                if os.path.exists(output_path):
-                    with open(output_path, "rb") as f:
-                        st.download_button(
-                            label="Download output.txt",
-                            data=f,
-                            file_name="output.txt",
-                            mime="text/plain"
-                        )
-                else:
-                    st.info("⚠️ output.txt not found in the specified folder")
+                run_dir = experiment["run_dir"]
+
+                # Создаём ZIP в памяти
+                zip_buffer = io.BytesIO()
+                with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zipf:
+                    for root, dirs, files in os.walk(run_dir):
+                        for file in files:
+                            file_path = os.path.join(root, file)
+                            arcname = os.path.relpath(file_path, run_dir)  # путь внутри архива
+                            zipf.write(file_path, arcname)
+
+                zip_buffer.seek(0)  # Ставим указатель в начало файла
+
+                st.subheader("📦 Simulation Output Files")
+                st.download_button(
+                    label="⬇️ Download All Output Files (.zip)",
+                    data=zip_buffer,
+                    file_name="simulation_output.zip",
+                    mime="application/zip"
+                )
+            else:
+                st.info("⚠️ No output files found or simulation not finished.")
 
             st.subheader("Parameters")
             params_array = experiment["params"].split(",")
